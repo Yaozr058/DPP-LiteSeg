@@ -30,4 +30,4 @@ Training commands I used to train the models (python .\Train_DPPLiteSeg.py)
 We provide a demo to quickly use the model (python .\Demo.py)
 ## Networking Framework
 Taking DPP-LiteSeg-L as an example(DeSTDC1 as the backbone network)
-![D2STDC1](https://github.com/user-attachments/assets/cf5d7d0d-80c0-425b-85bf-c3fdb1e4146d)
+[D2STDC1](https://github.com/user-attachments/assets/cf5d7d0d-80c0-425b-85bf-c3fdb1e4146d)
