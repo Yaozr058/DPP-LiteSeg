@@ -25,7 +25,10 @@ Download the dataset from the official [website](http://mi.eng.cam.ac.uk/researc
          /val_labels
 ```
 ## train
-Training commands I used to train the models (python .\Train_DPPLiteSeg.py)
+Training commands I used to train the models (python .\Train_DPPLiteSeg.py) 
+```
+ !!!we provided is not complete and only displays partial content. Please adjust according to your training needs!!!
+```
 ## Demo
 We provide a demo to quickly use the model (python .\Demo.py)
 ## Networking Framework
