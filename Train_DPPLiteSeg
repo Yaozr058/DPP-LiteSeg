@@ -1,0 +1,537 @@
+import torch.optim as optim
+import torchvision.transforms as transforms
+import argparse
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+import random
+from collections import defaultdict
+from PIL import Image, ImageFilter
+from torch.nn import DataParallel, CrossEntropyLoss
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from DPPLiteSeg_D2STDCNet import *
+from torch.amp import GradScaler
+from torch.utils.data import Dataset
+from collections import namedtuple
+from ultralytics import YOLO
+from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
+from torchvision.transforms import AutoAugment, AutoAugmentPolicy
+from torchvision.transforms.functional import adjust_brightness,adjust_contrast,crop,resized_crop,resize,perspective
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# Define command-line parameter parser
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Training DPP-LiteSeg on Camvid")
+    parser.add_argument("--model", default="DPPliteseg", type=str, help="Model to train")
+    parser.add_argument(
+        "--dataset", default="camvid", type=str, help="Dataset to train on"
+    )
+    parser.add_argument("--epoch", default=1000, type=int, help="Training epochs")
+    parser.add_argument(
+        "--loss_coefficient",
+        default=1,
+        type=float,
+        help="Coefficient for distillation loss",
+    )
+    parser.add_argument(
+        "--feature_loss_coefficient",
+        default=1,
+        type=float,
+        help="Coefficient for feature distillation loss",
+    )
+    parser.add_argument(
+        "--dataset_path", default=r"./data/camvid", type=str, help="Path to dataset"
+    )
+    parser.add_argument(
+        "--autoaugment", default=True, type=bool, help="Use auto augmentation"
+    )
+    parser.add_argument(
+        "--temperature", default=10.0, type=float, help="Temperature for distillation"
+    )
+    parser.add_argument("--batchsize", default=12, type=int, help="Batch size")
+    parser.add_argument(
+        "--init_lr", default=0.01, type=float, help="Initial learning rate"
+    )
+    parser.add_argument(
+        "--iou_loss_weight", default=1, type=float, help="IoU loss weight"
+    )
+    args = parser.parse_args()
+    print(args)
+    return args
+#Table Module
+class ToLongTensor(nn.Module):
+    def __init__(self):
+        super(ToLongTensor, self).__init__()
+    def forward(self, label):
+        label = np.array(label)
+        return torch.tensor(label, dtype=torch.long)
+
+class MapTrainId(nn.Module):
+    def __init__(self, id_to_train_id, ignore_index=255):
+        super(MapTrainId, self).__init__()
+        self.id_to_train_id = id_to_train_id
+        self.ignore_index = ignore_index
+    def forward(self, label):
+        if label.dtype != torch.long:
+            label = label.long()
+        train_id_label = torch.full_like(label, fill_value=self.ignore_index)
+        for label_id, train_id in self.id_to_train_id.items():
+            train_id_label[label == label_id] = train_id
+        return train_id_label
+
+def create_target_transform(id_to_train_id):
+    return nn.Sequential(ToLongTensor(), MapTrainId(id_to_train_id))
+#Defined by ourselves Camvid load_camvid
+class CamVid(Dataset):
+    def __init__(self, root, split, mode=None, transform=None, target_transform=None, sampling_strategy='none', mosaic_probability=0.3, image_size=(960, 720), max_shift=20):
+        self.root = root
+        self.split = split
+        self.transform = transform
+        self.target_transform = target_transform
+        self.mode = mode
+        self.images_dir = os.path.join(root, split)
+        self.labels_dir = os.path.join(root, f"{split}_labels")
+        self.mosaic_probability = mosaic_probability
+        self.image_size = image_size
+        self.max_shift = max_shift
+        assert os.path.exists(self.images_dir), f"{self.images_dir} NO FILES！"
+        assert os.path.exists(self.labels_dir), f"{self.labels_dir} NO FILES！"
+        self.filenames = sorted(os.listdir(self.images_dir))
+        self.sampling_strategy = sampling_strategy
+        if sampling_strategy == 'oversample':
+            self._oversample()
+    def _oversample(self):
+        class_to_filenames = defaultdict(list)
+        max_class_count = 0
+        for filename in self.filenames:
+            label_path = os.path.join(self.labels_dir, filename)
+            label = Image.open(label_path)
+            label = np.array(label)
+            unique, counts = np.unique(label, return_counts=True)
+            class_to_filenames[unique[0]].append(filename)
+            max_class_count = max(max_class_count, counts[0])
+        self.filenames = []
+        for class_id in class_to_filenames:
+            num_samples = max_class_count
+            if len(class_to_filenames[class_id]) < num_samples:
+                num_samples = len(class_to_filenames[class_id])
+            sampled_filenames = random.choices(class_to_filenames[class_id], k=num_samples)
+            self.filenames.extend(sampled_filenames)
+    def __len__(self):
+        return len(self.filenames)
+    def __getitem__(self, idx):
+        if random.random() < self.mosaic_probability:
+            # Randomly select four images and their labels for Mosaic enhancement
+            indices = [random.randint(0, len(self.filenames) - 1) for _ in range(4)]
+            images, targets = zip(*[self._load_data(i) for i in indices])
+
+            # Use Mosaic data augmentation (translation before stitching)
+            image, target = self._mosaic_transform(images, targets)
+        else:
+            # Normal load data
+            image, target = self._load_data(idx)
+
+        if self.transform:
+            image = self.transform(image)
+
+        if self.target_transform:
+            target = self.target_transform(target)
+
+        return image, target
+    def _load_data(self, idx):
+        filename = self.filenames[idx]
+        image_path = os.path.join(self.images_dir, filename)
+        label_path = os.path.join(self.labels_dir, filename)
+
+        image = Image.open(image_path).convert("RGB")
+        label = Image.open(label_path)
+
+        return image, label
+    def _mosaic_transform(self, images, targets):
+        assert len(images) == 4 and len(targets) == 4, "Mosaic requires four images and labels"
+
+        # Translate each image and label first
+        images, targets = zip(*[self.random_shift(image, target) for image, target in zip(images, targets)])
+
+        # Create a blank image and label
+        mosaic_image = Image.new('RGB', self.image_size, (128, 128, 128))
+        mosaic_target = Image.new('L', self.image_size, 255)  # 255 是忽略标签
+
+        # Determine the center point (randomly selected, within the range of 1/3 to 2/3 of the area)
+        center_x = random.randint( self.image_size[0] // 3, 2 * self.image_size[0] // 3)
+        center_y = random.randint( self.image_size[1] // 3, 2 * self.image_size[1] // 3)
+
+        # Define the regions of the four quadrants
+        regions = [
+            (0, 0, center_x, center_y),  
+            (center_x, 0, self.image_size[0], center_y),  
+            (0, center_y, center_x, self.image_size[1]),  
+            (center_x, center_y, self.image_size[0], self.image_size[1])  
+        ]
+
+        for i, (image, target) in enumerate(zip(images, targets)):
+            quadrant_width = regions[i][2] - regions[i][0]
+            quadrant_height = regions[i][3] - regions[i][1]
+            image_resized = image.resize((quadrant_width, quadrant_height), Image.BICUBIC)
+            target_resized = target.resize((quadrant_width, quadrant_height), Image.NEAREST)
+            
+            mosaic_image.paste(image_resized, (regions[i][0], regions[i][1]))
+            mosaic_target.paste(target_resized, (regions[i][0], regions[i][1]))
+
+        return mosaic_image, mosaic_target
+    def random_shift(self, image, target):
+        max_shift = self.max_shift
+        shift_x = random.randint(-max_shift, max_shift)
+        shift_y = random.randint(-max_shift, max_shift)
+        image = image.transform(image.size, Image.AFFINE, (1, 0, shift_x, 0, 1, shift_y))
+        target = target.transform(target.size, Image.AFFINE, (1, 0, shift_x, 0, 1, shift_y))
+        return image, target
+
+def detect_small_objects(image, min_object_size=5200, threshold=0.6):
+    model = YOLO('yolov8n')
+    model.eval()
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = model(image_rgb)
+    small_objects = []
+    for result in results:
+        boxes = result.boxes.xyxy.cpu().numpy()  #  [x1, y1, x2, y2]
+        labels = result.boxes.cls.cpu().numpy()  
+        scores = result.boxes.conf.cpu().numpy()  
+        for box, label, score in zip(boxes, labels, scores):
+            if score > threshold:
+                object_area = (box[2] - box[0]) * (box[3] - box[1])
+                # If the area of an object is less than the specified minimum area and the score exceeds the threshold, it is considered a small object
+                if object_area < min_object_size:
+                    small_objects.append(box)
+    return small_objects
+
+class DynamicCropSmallObjects:
+    def __init__(self, base_crop_size=(300, 120), expand_factor=(1.2, 3.0), probability=0.5, min_object_size=5200, threshold=0.5):
+        self.base_crop_size = base_crop_size
+        self.expand_factor = expand_factor
+        self.probability = probability
+        self.min_object_size = min_object_size
+        self.threshold = threshold
+    def __call__(self, image, target):
+        if random.random() < self.probability:
+            image_np = np.array(image)
+            target_np = np.array(target)
+
+            # small objects
+            small_objects = detect_small_objects(target_np, self.min_object_size, self.threshold)
+            if small_objects:
+                # random small object
+                box = small_objects[random.randint(0, len(small_objects) - 1)]
+                x1, y1, x2, y2 = box
+                center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+
+                expand_factor = random.uniform(*self.expand_factor)
+                crop_width = int((x2 - x1) * expand_factor + self.base_crop_size[1])
+                crop_height = int((y2 - y1) * expand_factor + self.base_crop_size[0])
+
+                crop_top = max(0, center_y - crop_height // 2)
+                crop_left = max(0, center_x - crop_width // 2)
+                crop_bottom = min(image.size[1], crop_top + crop_height)
+                crop_right = min(image.size[0], crop_left + crop_width)
+
+                crop_top = max(0, crop_bottom - crop_height)
+                crop_left = max(0, crop_right - crop_width)
+
+                image = crop(image, crop_top, crop_left, crop_bottom - crop_top, crop_right - crop_left)
+                target = crop(target, crop_top, crop_left, crop_bottom - crop_top, crop_right - crop_left)
+        return image, target
+
+class RandomZoomSmallObjects:
+    """random zoom small objects"""
+    def __init__(self, zoom_range=(1.2, 3.0), probability=0.5, min_object_size=5200, threshold=0.5):
+        self.zoom_range = zoom_range
+        self.probability = probability
+        self.min_object_size = min_object_size
+        self.threshold = threshold
+    def __call__(self, image, target):
+        if random.random() < self.probability:
+            image_np = np.array(image)
+            small_objects = detect_small_objects(image_np, self.min_object_size, self.threshold)
+            if small_objects:
+                box = small_objects[random.randint(0, len(small_objects) - 1)]
+                x1, y1, x2, y2 = box
+                center_y, center_x = (y1 + y2) // 2, (x1 + x2) // 2
+                zoom_factor = random.uniform(*self.zoom_range)
+                zoom_height = int((y2 - y1) * zoom_factor)
+                zoom_width = int((x2 - x1) * zoom_factor)
+                crop_top = max(0, center_y - zoom_height // 2)
+                crop_left = max(0, center_x - zoom_width // 2)
+                crop_bottom = min(image.size[1], crop_top + zoom_height)
+                crop_right = min(image.size[0], crop_left + zoom_width)
+                image = resized_crop(image, crop_top, crop_left, crop_bottom - crop_top, crop_right - crop_left, image.size)
+                target = resized_crop(target, crop_top, crop_left, crop_bottom - crop_top, crop_right - crop_left, target.size)
+        return image, target
+
+#CustomTransform and ValidationTransform
+class CustomTransform:
+    def __init__(self, image_size=(960, 720)):
+        self.image_size = image_size
+        self.augment = transforms.Compose([
+            DynamicCropSmallObjects(base_crop_size=(256, 128), expand_factor=(1.5, 2.5), probability=0.5,
+                                    min_object_size=5200, threshold=0.5),
+            RandomZoomSmallObjects(zoom_range=(1.2, 2.5), probability=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize((0.286, 0.325, 0.283), (0.175, 0.180, 0.177))
+        ])
+
+    def __call__(self, image, target):
+        for transform in self.augment.transforms:
+            if hasattr(transform, '__call__'):
+                image, target = transform(image, target)
+        return image, target
+
+class ValidationTransform:
+    """Data preprocessing during verification and testing phases"""
+    def __init__(self, image_size=(960, 720)):
+        self.image_size = image_size
+        self.transform = transforms.Compose([
+            transforms.Resize(self.image_size),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),  
+        ])
+    def __call__(self, image):
+        return self.transform(image)
+#加载load_camvid
+def load_camvid(args, split, mode, sampling_strategy='none'):
+    if mode == 'train':
+        transform = CustomTransform(image_size=(960, 720))  # 更新为支持自动增强的 transform
+    else:
+        transform = ValidationTransform(image_size=(960, 720))
+    id_to_train_id = {cls.id: cls.train_id for cls in classes}
+    target_transform = create_target_transform(id_to_train_id)
+    dataset = CamVid(
+        root=args.dataset_path,
+        split=split,
+        mode=mode,
+        transform=transform,
+        target_transform=target_transform,
+        sampling_strategy=sampling_strategy,
+        mosaic_probability=0.4,
+    )
+    return dataset
+
+def cross_entropy_loss_with_soft_labels(student_outputs, teacher_outputs, temperature):
+    student_logits = student_outputs / temperature
+    teacher_logits = teacher_outputs / temperature
+    student_log_probs = F.log_softmax(student_logits, dim=1)
+    teacher_probs = F.softmax(teacher_logits, dim=1)
+    return -(teacher_probs * student_log_probs).sum(dim=1).mean()
+#Camvid
+CamvidClass = namedtuple(
+    "CamVidClass",
+    ["name", "id", "train_id", "category", "category_id", "has_instances", "ignore_in_eval", "color"]
+)
+#CamVid 
+
+classes = [
+    CamvidClass("Animal", 0, 255, "Moving objects", 0, True, True, (0, 0, 0)),
+    CamvidClass("Archway", 1, 255, "Ceiling", 2, False, True, (0, 0, 0)),
+    CamvidClass("Bicyclist", 2, 9, "Moving objects", 0, True, False, (0, 128, 192)),
+    CamvidClass("Bridge", 3, 255, "Fixed objects", 3, False, True, (0, 0, 0)),
+    CamvidClass("Building", 4, 1, "Fixed objects", 3, False, False, (128, 0, 0)),
+    CamvidClass("Car", 5, 5, "Moving objects", 0, True, False, (64, 0, 128)),
+    CamvidClass("CartLuggagePram", 6, 255, "Moving objects", 0, True, True, (64, 0, 192)),
+    CamvidClass("Child", 7, 255, "Moving objects", 0, True, True, (192, 128, 64)),
+    CamvidClass("Column_Pole", 8, 6, "Fixed objects", 3, False, False, (192, 192, 128)),
+    CamvidClass("Fence", 9, 7, "Fixed objects", 3, False, False, (64, 64, 128)),
+    CamvidClass("LaneMkgsDriv", 10, 255, "Road", 1, False, True, (128, 0, 192)),
+    CamvidClass("LaneMkgsNonDriv", 11, 255, "Road", 1, False, True, (192, 0, 64)),
+    CamvidClass("Misc_Text", 12, 255, "Fixed objects", 3, False, True, (128, 128, 64)),
+    CamvidClass("MotorcycleScooter", 13, 255, "Moving objects", 0, True, True, (192, 0, 192)),
+    CamvidClass("OtherMoving", 14, 255, "Fixed objects", 3, False, True, (0, 0, 0)),
+    CamvidClass("ParkingBlock", 15, 255, "Fixed objects", 3, False, True, (0, 0, 0)),
+    CamvidClass("Pedestrian", 16, 8, "Moving objects", 0, True, False, (64, 64, 0)),
+    CamvidClass("Road", 17, 0, "Road", 1, False, False, (128, 64, 128)),
+    CamvidClass("RoadShoulder", 18, 255, "Road", 1, False, True, (128, 128, 192)),
+    CamvidClass("Sidewalk", 19, 4, "Fixed objects", 3, False, False, (0, 0, 192)),
+    CamvidClass("SignSymbol", 20, 10, "Fixed objects", 3, False, False, (192, 128, 128)),
+    CamvidClass("Sky", 21, 2, "Ceiling", 2, False, False, (128, 128, 128)),
+    CamvidClass("SUVPickupTruck", 22, 255, "Moving objects", 0, True, True, (64, 128, 192)),
+    CamvidClass("TrafficCone", 23, 255, "Fixed objects", 3, False, True, (0, 0, 0)),
+    CamvidClass("TrafficLight", 24, 255, "Fixed objects", 3, False, True, (0, 0, 0)),
+    CamvidClass("Train", 25, 255, "Moving objects", 0, True, True, (192, 64, 128)),
+    CamvidClass("Tree", 26, 3, "Fixed objects", 3, False, False, (128, 128, 0)),
+    CamvidClass("Truck_Bus", 27, 255, "Moving objects", 0, True, True, (192, 128, 192)),
+    CamvidClass("Tunnel", 28, 255, "Ceiling", 2, False, True, (64, 0, 64)),
+    CamvidClass("VegetationMisc", 29, 255, "Fixed objects", 3, False, True, (0, 0, 0)),
+    CamvidClass("Void", 30, 255, "Fixed objects", 3, False, True, (0, 0, 0)),
+    CamvidClass("Wall", 31, 255, "Fixed objects", 3, False, True, (64, 192, 0)),
+]
+#loss
+def iou_loss(pred, target,class_weights, num_classes,  smooth=1e-6):
+    ignore_index = 255
+    target = target.clone()
+    valid_mask = target != ignore_index
+    target[target == ignore_index] = 0
+
+    pred = F.softmax(pred, dim=1)
+    target_onehot = torch.zeros_like(pred).scatter_(1, target.unsqueeze(1), 1)
+    target_onehot = target_onehot * valid_mask.unsqueeze(1)
+
+    intersection = (pred * target_onehot).sum(dim=(2, 3))
+    union = (pred + target_onehot - pred * target_onehot).sum(dim=(2, 3))
+    iou = (intersection + smooth) / (union + smooth)
+
+    if class_weights is None:
+        class_weights = [1.0] * num_classes
+
+    weighted_iou_loss = 0.0
+    total_weight = 0.0
+    for c in range(num_classes-1):
+        weighted_iou_loss += (1 - iou[:, c]) * class_weights[c]
+        total_weight += class_weights[c]
+
+    return weighted_iou_loss.mean() / max(total_weight, 1.0)
+
+def calculate_iou(predicted, target, num_classes, class_weights=None):
+    iou_list = [0.0] * (num_classes-1)
+    total_weight = 0.0
+    weighted_sum_iou = 0.0
+
+    if class_weights is None:
+        class_weights = [1.0] * (num_classes-1)
+
+    for class_id in range(num_classes-1):
+        mask = (target != 255)  # 过滤无效区域
+        intersection = ((predicted == class_id) & (target == class_id) & mask).sum().item()
+        union = (((predicted == class_id) | (target == class_id)) & mask).sum().item()
+        if union > 0:
+            iou_list[class_id] = intersection / union
+
+        # 加权 IoU
+        weighted_sum_iou += class_weights[class_id] * iou_list[class_id]
+        total_weight += class_weights[class_id]
+
+    weighted_mean_iou = weighted_sum_iou / max(total_weight, 1.0)
+    return iou_list, weighted_mean_iou
+
+
+def train(args, net, teacher_net, optimizer, criterion, trainloader, valloader, testloader):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = net.to(device)
+    teacher_net = teacher_net.to(device)
+    scaler = GradScaler()
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=200)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=(args.epoch - 100))
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[100])
+    accumulation_steps = 2  # Gradient accumulation steps
+    best_mean_iou = 0
+    best_test_iou = 0
+    train_losses = []
+    val_losses = []
+    train_accuracies = []
+    val_accuracies = []
+    val_iou = []
+    test_iou = []
+    length_class = 12
+    initial_temperature = args.temperature
+    decay_rate = 0.98  
+
+    for epoch in range(args.epoch):
+        args.temperature = initial_temperature * (decay_rate ** epoch)
+        correct = [0] * length_class
+        total = 0.0
+        sum_loss = 0.0
+        net.train()
+
+        for i, (inputs, labels) in enumerate(tqdm(trainloader, desc=f"Epoch {epoch + 1}")):
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            with torch.no_grad():
+                teacher_outputs = teacher_net(inputs)
+                teacher_outputs = F.interpolate(
+                    teacher_outputs[0], size=labels.shape[1:], mode='bilinear', align_corners=False
+                )
+
+            with torch.autocast(device_type="cuda"):
+                student_outputs = net(inputs)
+                labels = labels.squeeze(1)
+                student_outputs[0] = F.interpolate(student_outputs[0], size=labels.shape[1:], mode='bilinear', align_corners=False)
+                main_loss = criterion(student_outputs[0], labels)
+                # IoU loss
+                class_frequencies = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+                class_weights = [1.0 / max(freq, 1e-6) for freq in class_frequencies]  # 反比例频率
+                iou_loss_value = iou_loss(student_outputs[0], labels, class_weights, num_classes=length_class)
+                # distillation loss
+                distillation_loss = cross_entropy_loss_with_soft_labels(
+                    student_outputs[0],
+                    teacher_outputs,
+                    args.temperature
+                )
+                # LOSS
+                loss_weights = {
+                    "main_loss": 1.0,
+                    "iou_loss": 3.0,
+                    "kd_loss": 0.5 * args.temperature * args.temperature 
+                }
+                loss = (
+                    main_loss * loss_weights["main_loss"]
+                    + iou_loss_value * loss_weights["iou_loss"]
+                    + distillation_loss * loss_weights["kd_loss"]
+                )
+
+            scaler.scale(loss).backward()
+            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(trainloader):
+                scaler.step(optimizer)
+                scaler.update() 
+                optimizer.zero_grad()  
+            sum_loss += loss.item()
+            _, predicted_indices = torch.max(student_outputs[0].data, 1)
+            predicted_indices_resized = F.interpolate(
+                predicted_indices.unsqueeze(1).float(),
+                size=labels.shape[-2:], mode='nearest'
+            ).squeeze(1).long()
+            correct[0] += predicted_indices_resized.eq(labels.data).cpu().sum().item()
+            total += labels.numel()
+
+        val_loss, val_acc, val_mean_iou = validate(args, net, criterion, valloader, epoch)
+        scheduler.step()  
+
+        train_losses.append(sum_loss / len(trainloader))
+        train_accuracies.append(100 * correct[0] / total)
+        val_losses.append(val_loss)
+        val_accuracies.append(val_acc)
+        val_iou.append(val_mean_iou)
+        test_loss, test_acc, test_mean_iou = test(args, net, criterion, testloader, epoch)
+        test_iou.append(test_mean_iou)
+        print(f"Test Loss: {test_loss:.03f}, Test Accuracy: {test_acc:.2f}%, Test Mean IoU: {test_mean_iou:.4f}")
+        print(
+            f"Epoch {epoch + 1} - "
+            f"Train Loss: {sum_loss / len(trainloader):.03f}, Train Accuracy: {100 * correct[0] / total:.2f}%, "
+            f"Val Loss: {val_loss:.03f}, Val Accuracy: {val_acc:.2f}%, Mean IoU: {val_mean_iou:.4f}"
+        )
+
+        if  val_mean_iou > best_mean_iou:
+            best_mean_iou = val_mean_iou
+            torch.save(net.state_dict(), f"best_Camvid_23slim_noeca1{args.model}.pth")
+        if  test_mean_iou > best_test_iou:
+            best_test_iou = test_mean_iou
+            torch.save(net.state_dict(), f"best_Camvid_test_23slim_oneca1{args.model}.pth")
+    plot_curves(train_losses, val_losses, train_accuracies, val_accuracies, args)
+
+#main
+def main():
+    args = parse_arguments()
+    teacher_net = ppliteseg_test_ddr(num_classes=12, backbone=STDCNet(), pretrained=True)
+    teacher_net.eval() 
+    student_net = (ppliteseg_test_ddr
+                   (num_classes=12, backbone=STDCNet(),pretrained=True))
+    # Define loss function and optimizer
+    criterion = CrossEntropyLoss(ignore_index=255,label_smoothing=0.1)
+    optimizer = optim.Adam(student_net.parameters(), lr=args.init_lr, weight_decay=1e-4)
+    trainset = load_camvid(args, split="train", mode="fine",sampling_strategy='oversample')
+    valset = load_camvid(args, split="val", mode="fine",sampling_strategy='oversample')
+    testset = load_camvid(args, split="test", mode="fine")
+    testloader = DataLoader(testset, batch_size=args.batchsize, shuffle=False, num_workers=12)
+    trainloader = DataLoader(trainset, batch_size=args.batchsize, shuffle=True, num_workers=12)
+    valloader = DataLoader(valset, batch_size=args.batchsize, shuffle=False, num_workers=12)
+    train(args, student_net, teacher_net, optimizer, criterion, trainloader, valloader, testloader)
+if __name__ == "__main__":
+    main()
