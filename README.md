@@ -1,5 +1,5 @@
 # DPP-LiteSeg: A real-time semantic segmentation model of urban street scenes
-
+DPP LiteSeg is a semantic segmentation model for urban landscapes, which is based on the Pp LiteSeg framework to better analyze detailed and contextual information. Combining Adaptive Efficient Channel Attention (AECA) with the use of DeSTDCNet backbone network. In addition, we used the YOLO+Mosaic data augmentation method for small-scale datasets. The DPP LiteSeg series achieves an excellent balance between inference speed and accuracy. Specifically, on the small dataset CamVid, DPP LiteSeg with DeSTDC1 backbone achieved an average joint crossover (mIoU) of 78.21% at 162.3 frames per second (FPS), while using DeSTDC2 backbone achieved 80.45% mIoU at 156.1 FPS.
 ## platform
 My platform is like this:
 
