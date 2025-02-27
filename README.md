@@ -26,3 +26,5 @@ Download the dataset from the official [website](http://mi.eng.cam.ac.uk/researc
 ```
 ## train
 Training commands I used to train the models (python .\Train_DPPLiteSeg.py)
+## Demo
+We provide a demo to quickly use the model (python .\Demo.py)
