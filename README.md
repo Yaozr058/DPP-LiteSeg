@@ -15,11 +15,11 @@ My platform is like this:
 ## prepare dataset
 * camvid
 Download the dataset from the official [website](http://mi.eng.cam.ac.uk/research/projects/VideoRec/CamVid/). Then decompress them into the `data/camvid` directory:  
-data
-   --CamVid
-      --test
-      --test_labels
-      --train
-      --train_labels
-      --val
-      --val_labels  
+```
+  data/CamVid
+         /test
+         /test_labels
+         /train
+         /train_labels
+         /val
+         /val_labels  
