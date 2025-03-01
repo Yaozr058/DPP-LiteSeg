@@ -13,7 +13,7 @@ My platform is like this:
 * pytorch 2.5.0
 
 
-## prepare dataset
+## Prepare Dataset
 * camvid
 Download the dataset from the official [website](http://mi.eng.cam.ac.uk/research/projects/VideoRec/CamVid/). Then decompress them into the `data/camvid` directory:  
 ```
@@ -25,7 +25,7 @@ Download the dataset from the official [website](http://mi.eng.cam.ac.uk/researc
          /val
          /val_labels
 ```
-## train
+## Train
 Training commands I used to train the models (python .\Train_DPPLiteSeg.py) 
 ```
  !!!we provided is not complete and only displays partial content. Please adjust according to your training needs!!!
@@ -35,3 +35,7 @@ We provide a demo to quickly use the model (python .\Demo.py)
 ## Networking Framework
 Taking DPP-LiteSeg-L as an example(DeSTDC1 as the backbone network)
 [D2STDC1](https://github.com/user-attachments/assets/cf5d7d0d-80c0-425b-85bf-c3fdb1e4146d)
+## Inference Results
+![image](https://github.com/user-attachments/assets/d1005a9d-69dc-4701-8f24-f88af04348e3)
+![image](https://github.com/user-attachments/assets/601b469e-e697-4c2f-b3da-a0df32b81ae3)
+* The inference results may be affected by the inference environment and equipment
