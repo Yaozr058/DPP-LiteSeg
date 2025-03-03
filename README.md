@@ -26,7 +26,7 @@ Download the dataset from the official [website](http://mi.eng.cam.ac.uk/researc
          |-val
          |-val_labels
 ```
-OR [website]([https://github.com/Yaozr058/DPP-LiteSeg/tree/data])
+OR [website](https://github.com/Yaozr058/DPP-LiteSeg/tree/data)
 ## Train
 Training commands I used to train the models (python .\Train_DPPLiteSeg.py) 
 ```
