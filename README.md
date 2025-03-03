@@ -15,7 +15,7 @@ My platform is like this:
 
 ## Prepare Dataset
 * camvid
-Download the dataset from the official [website](https://github.com/Yaozr058/data/tree/master). Then decompress them into the `data/camvid` directory:  
+Download the dataset from the official [website](http://mi.eng.cam.ac.uk/research/projects/VideoRec/CamVid/).Then decompress them into the `data/camvid` directory:  
 ```
     |-data
        |-CamVid
@@ -26,7 +26,7 @@ Download the dataset from the official [website](https://github.com/Yaozr058/dat
          |-val
          |-val_labels
 ```
-* OR Download at the [website](https://github.com/Yaozr058/DPP-LiteSeg/tree/data)
+* OR Download at the [website]((https://github.com/Yaozr058/data/tree/master))
 ## Train
 Training commands I used to train the models (python .\Train_DPPLiteSeg.py) 
 ```
