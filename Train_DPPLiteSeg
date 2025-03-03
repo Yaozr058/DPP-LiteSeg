@@ -208,7 +208,7 @@ def detect_small_objects(image, min_object_size=5200, threshold=0.6):
     return small_objects
 
 class DynamicCropSmallObjects:
-    def __init__(self, base_crop_size=(300, 120), expand_factor=(1.2, 3.0), probability=0.5, min_object_size=5200, threshold=0.5):
+    def __init__(self, base_crop_size=(*, *), expand_factor=(1.2, 3.0), probability=0.5, min_object_size=*, threshold=0.5): # * Set parameters according to actual needs
         self.base_crop_size = base_crop_size
         self.expand_factor = expand_factor
         self.probability = probability
@@ -245,7 +245,7 @@ class DynamicCropSmallObjects:
 
 class RandomZoomSmallObjects:
     """random zoom small objects"""
-    def __init__(self, zoom_range=(1.2, 3.0), probability=0.5, min_object_size=5200, threshold=0.5):
+    def __init__(self, zoom_range=(*,*), probability=0.5, min_object_size=*, threshold=0.5):
         self.zoom_range = zoom_range
         self.probability = probability
         self.min_object_size = min_object_size
